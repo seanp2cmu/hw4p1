@@ -351,12 +351,20 @@ class LMTrainer(BaseTrainer):
         with torch.inference_mode():
             if generation_config.get('top_k', 0) > 0 or generation_config.get('top_p', 0) > 0:
                 print("Generating with sampling...")
-                seqs, scores = NotImplementedError, NotImplementedError
-                raise NotImplementedError # Remove if you implemented the sampling method
+                seqs, scores = generator.generate_sample(
+                    prompts,
+                    temperature=generation_config.get('temperature', 1.0),
+                    top_k=generation_config.get('top_k', 0),
+                    top_p=generation_config.get('top_p', 1.0)
+                )
             elif generation_config.get('beam_width', 1) > 1:
                 print("Generating with beam search...")
-                seqs, scores = NotImplementedError, NotImplementedError
-                raise NotImplementedError # Remove if you implemented the beam search method
+                seqs, scores = generator.generate_beam(
+                    prompts,
+                    beam_width=generation_config.get('beam_width', 1),
+                    temperature=generation_config.get('temperature', 1.0),
+                    repeat_penalty=generation_config.get('repeat_penalty', 1.0)
+                )
                 # Take best beam and score
                 seqs = seqs[:, 0]
                 scores = scores[:, 0]
