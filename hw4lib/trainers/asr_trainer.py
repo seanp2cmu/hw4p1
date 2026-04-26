@@ -12,6 +12,7 @@ import json
 import torchmetrics.text as tmt
 from torch.utils.data import Subset
 import pandas as pd
+from torch.optim.swa_utils import AveragedModel
 
 
 class ASRTrainer(BaseTrainer):
@@ -59,22 +60,20 @@ class ASRTrainer(BaseTrainer):
 
         # TODO: Implement the __init__ method
         
-        # TODO: Initialize CE loss
-        # How would you set the ignore_index? 
-        # Use value in config to set the label_smoothing argument
-        self.ce_criterion = NotImplementedError
-        
-        # TODO: Initialize CTC loss if needed
-        # You can use the pad token id as the blank index
+        # Initialize CE loss
+        self.ce_criterion = nn.CrossEntropyLoss(
+            ignore_index=self.tokenizer.pad_id,
+            label_smoothing=self.config['loss'].get('label_smoothing', 0.0)
+        )
+
+        # Initialize CTC loss if needed
         self.ctc_criterion = None
         self.ctc_weight = self.config['loss'].get('ctc_weight', 0.0)
         if self.ctc_weight > 0:
             self.ctc_criterion = nn.CTCLoss(
-                blank=self.tokenizer.pad_id,
+                blank=self.tokenizer.blank_id,
                 zero_infinity=True
             )
-        
-        raise NotImplementedError # Remove once implemented
 
 
     def _train_epoch(self, dataloader):
@@ -86,9 +85,6 @@ class ASRTrainer(BaseTrainer):
         Returns:
             Tuple[Dict[str, float], Dict[str, torch.Tensor]]: Training metrics and attention weights
         """
-        # TODO: In-fill the _train_epoch method
-        raise NotImplementedError # Remove once implemented
-    
         # Initialize training variables
         self.model.train()
         batch_bar = tqdm(total=len(dataloader), dynamic_ncols=True, leave=False, position=0, desc="[Training ASR]")
@@ -102,23 +98,37 @@ class ASRTrainer(BaseTrainer):
         self.optimizer.zero_grad()
 
         for i, batch in enumerate(dataloader):
-            # TODO: Unpack batch and move to device
+            # Unpack batch and move to device
             feats, targets_shifted, targets_golden, feat_lengths, transcript_lengths = batch
+            feats              = feats.to(self.device)
+            targets_shifted    = targets_shifted.to(self.device)
+            targets_golden     = targets_golden.to(self.device)
+            feat_lengths       = feat_lengths.to(self.device)
+            transcript_lengths = transcript_lengths.to(self.device)
 
             with torch.autocast(device_type=self.device, dtype=torch.float16):
-                # TODO: get raw predictions and attention weights and ctc inputs from model
-                seq_out, curr_att, ctc_inputs = NotImplementedError
-                
+                # Get raw predictions, attention weights, and CTC inputs from model
+                seq_out, curr_att, ctc_inputs = self.model(
+                    feats, targets_shifted, feat_lengths, transcript_lengths
+                )
+
                 # Update running_att with the latest attention weights
                 running_att = curr_att
-                
-                # TODO: Calculate CE loss
-                ce_loss = NotImplementedError
-                
-                
-                # TODO: Calculate CTC loss if needed
+
+                # Calculate CE loss
+                ce_loss = self.ce_criterion(
+                    seq_out.reshape(-1, self.model.num_classes),
+                    targets_golden.reshape(-1)
+                )
+
+                # Calculate CTC loss if needed
                 if self.ctc_weight > 0:
-                    ctc_loss = NotImplementedError
+                    ctc_loss = self.ctc_criterion(
+                        ctc_inputs['log_probs'],
+                        targets_golden,
+                        ctc_inputs['lengths'],
+                        transcript_lengths - 1
+                    )
                     loss = ce_loss + self.ctc_weight * ctc_loss
                 else:
                     ctc_loss = torch.tensor(0.0)
@@ -131,12 +141,12 @@ class ASRTrainer(BaseTrainer):
             if self.ctc_weight > 0:
                 running_ctc_loss += ctc_loss.item() * batch_tokens
             running_joint_loss += loss.item() * batch_tokens
-            
+
             # Normalize loss by accumulation steps
             loss = loss / self.config['training']['gradient_accumulation_steps']
 
-            # TODO: Backpropagate the loss
-            self.scaler = NotImplementedError
+            # Backpropagate the loss
+            self.scaler.scale(loss).backward()
 
             # Only update weights after accumulating enough gradients
             if (i + 1) % self.config['training']['gradient_accumulation_steps'] == 0:
@@ -199,10 +209,24 @@ class ASRTrainer(BaseTrainer):
         Returns:
             Tuple[Dict[str, float], List[Dict[str, Any]]]: Validation metrics and recognition results
         """
-        # TODO: In-fill the _validate_epoch method
-        raise NotImplementedError # Remove once implemented
-        
-    
+        val_recognition_config = {
+            'num_batches': 15,
+            'beam_width': 1,
+            'temperature': 1.0,
+            'repeat_penalty': 1.0,
+            'lm_weight': 0.0,
+            'lm_model': None
+        }
+        val_max_len = min(getattr(self, 'text_max_len', 200), 200)
+        results = self.recognize(dataloader, val_recognition_config, 'val_greedy', max_length=val_max_len)
+
+        references = [r['target'] for r in results]
+        hypotheses = [r['generated'] for r in results]
+        metrics    = self._calculate_asr_metrics(references, hypotheses)
+
+        return metrics, results
+
+
     def train(self, train_dataloader, val_dataloader, epochs: int):
         """
         Full training loop for ASR training.
@@ -218,9 +242,6 @@ class ASRTrainer(BaseTrainer):
         if self.optimizer is None:
             raise ValueError("Optimizer is not initialized, initialize it first!")
         
-        # TODO: In-fill the train method
-        raise NotImplementedError # Remove once implemented
-
         # Set max transcript length
         self.text_max_len = max(val_dataloader.dataset.text_max_len, train_dataloader.dataset.text_max_len)
 
@@ -230,13 +251,17 @@ class ASRTrainer(BaseTrainer):
         best_val_cer  = float('inf')
         best_val_dist = float('inf')
 
+        # SWA setup
+        swa_start_epoch = self.config['training'].get('swa_start_epoch', int(0.8 * epochs))
+        swa_model = None
+
         for epoch in range(self.current_epoch, self.current_epoch + epochs):
 
-            # TODO: Train for one epoch
-            train_metrics, train_attn = NotImplementedError, NotImplementedError
-            
-            # TODO: Validate
-            val_metrics, val_results = NotImplementedError, NotImplementedError
+            # Train for one epoch
+            train_metrics, train_attn = self._train_epoch(train_dataloader)
+
+            # Validate
+            val_metrics, val_results = self._validate_epoch(val_dataloader)
 
             # Step ReduceLROnPlateau scheduler with validation loss
             if isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
@@ -257,15 +282,13 @@ class ASRTrainer(BaseTrainer):
                 decoder_cross_keys = [k for k in train_attn_keys if 'dec_cross' in k]
                 
                 if decoder_self_keys:
-                    # Plot first layer (layer1) if available
                     first_self_key = decoder_self_keys[0]
-                    if first_self_key in train_attn:
+                    if first_self_key in train_attn and train_attn[first_self_key] is not None:
                         self._save_attention_plot(train_attn[first_self_key][0], epoch, "decoder_self")
                 
                 if decoder_cross_keys:
-                    # Plot last layer if available
                     last_cross_key = decoder_cross_keys[-1]
-                    if last_cross_key in train_attn:
+                    if last_cross_key in train_attn and train_attn[last_cross_key] is not None:
                         self._save_attention_plot(train_attn[last_cross_key][0], epoch, "decoder_cross")
             
             # Save generated text
@@ -278,9 +301,47 @@ class ASRTrainer(BaseTrainer):
             if val_metrics['cer'] < best_val_cer:
                 best_val_cer = val_metrics['cer']
                 self.best_metric = val_metrics['cer']
-                self.save_checkpoint('checkpoint-best-metric-model.pth') 
+                self.save_checkpoint('checkpoint-best-metric-model.pth')
+
+            # --- SWA update ---
+            if epoch >= swa_start_epoch:
+                try:
+                    if swa_model is None:
+                        print(f"[SWA] Starting SWA averaging from epoch {epoch}")
+                        swa_model = AveragedModel(self.model)
+                    else:
+                        swa_model.update_parameters(self.model)
+                    # Save SWA weights every epoch so a crash doesn't lose progress
+                    import os as _os
+                    swa_ckpt_path = _os.path.join(self.checkpoint_dir, 'checkpoint-swa-latest.pth')
+                    torch.save({
+                        'model_state_dict': swa_model.module.state_dict(),
+                        'epoch': epoch,
+                        'n_averaged': swa_model.n_averaged.item()
+                    }, swa_ckpt_path)
+                    print(f"[SWA] Updated & saved SWA checkpoint (n_avg={swa_model.n_averaged.item()})")
+                except Exception as e:
+                    print(f"[SWA] Warning at epoch {epoch}: {e}")
 
             self.current_epoch += 1
+
+        # --- Finalise SWA ---
+        if swa_model is not None:
+            print("[SWA] Applying final averaged weights to model...")
+            try:
+                self.model.load_state_dict(swa_model.module.state_dict())
+                self.save_checkpoint('checkpoint-swa-final.pth')
+                print("[SWA] Saved checkpoint-swa-final.pth")
+            except Exception as e:
+                print(f"[SWA] Warning: could not apply final SWA weights: {e}")
+                # Try saving raw SWA module state dict directly as fallback
+                try:
+                    import os as _os
+                    torch.save({'model_state_dict': swa_model.module.state_dict()},
+                               _os.path.join(self.checkpoint_dir, 'checkpoint-swa-fallback.pth'))
+                    print("[SWA] Fallback: saved raw SWA state_dict to checkpoint-swa-fallback.pth")
+                except Exception as e2:
+                    print(f"[SWA] Fallback also failed: {e2}")
                 
 
     def evaluate(self, dataloader, max_length: Optional[int] = None) -> Dict[str, Dict[str, float]]:
@@ -340,9 +401,6 @@ class ASRTrainer(BaseTrainer):
         """
         if max_length is None and not hasattr(self, 'text_max_len'):
             raise ValueError("text_max_len is not set. Please run training loop first or provide a max_length")
-        
-        # TODO: In-fill the recognize method
-        raise NotImplementedError # Remove once implemented
 
         if recognition_config is None:
             # Default config (greedy search)
@@ -380,8 +438,10 @@ class ASRTrainer(BaseTrainer):
                 # TODO: Handle both cases where targets may or may not be None (val set v. test set) 
                 feats, _, targets_golden, feat_lengths, _ = batch
                 
-                # TODO: Encode speech features to hidden states
-                encoder_output, pad_mask_src, _, _ = NotImplementedError, NotImplementedError, NotImplementedError, NotImplementedError
+                # Encode speech features to hidden states
+                feats       = feats.to(self.device)
+                feat_lengths = feat_lengths.to(self.device)
+                encoder_output, pad_mask_src, _, _ = self.model.encode(feats, feat_lengths)
                 
                 # Define scoring function for this batch
                 def get_score(x):
@@ -394,22 +454,30 @@ class ASRTrainer(BaseTrainer):
                 # Set score function of generator
                 generator.score_fn = get_score
 
-                # TODO: Initialize prompts as a batch of SOS tokens
+                # Initialize prompts as a batch of SOS tokens
                 batch_size = feats.size(0)
-                prompts = NotImplementedError
+                prompts = torch.full(
+                    (batch_size, 1), self.tokenizer.sos_id,
+                    dtype=torch.long, device=self.device
+                )
 
-                # TODO: Generate sequences
+                # Generate sequences
                 if recognition_config['beam_width'] > 1:
-                    # TODO: If you have implemented beam search, generate sequences using beam search
-                    seqs, scores = NotImplementedError, NotImplementedError
-                    raise NotImplementedError # Remove if you implemented the beam search method
+                    seqs, scores = generator.generate_beam(
+                        prompts,
+                        beam_width=recognition_config['beam_width'],
+                        temperature=recognition_config['temperature'],
+                        repeat_penalty=recognition_config['repeat_penalty']
+                    )
                     # Pick best beam
-                    seqs = seqs[:, 0, :]
+                    seqs   = seqs[:, 0, :]
                     scores = scores[:, 0]
                 else:
-                    # TODO: Generate sequences using greedy search
-                    seqs, scores = NotImplementedError, NotImplementedError
-                    raise NotImplementedError # Remove if you implemented the greedy search method
+                    seqs, scores = generator.generate_greedy(
+                        prompts,
+                        temperature=recognition_config['temperature'],
+                        repeat_penalty=recognition_config['repeat_penalty']
+                    )
 
                 # Clean up
                 del feats, feat_lengths, encoder_output, pad_mask_src, prompts

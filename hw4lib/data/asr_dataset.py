@@ -1,5 +1,6 @@
 from typing import Literal, Tuple, Optional
 import os
+import hashlib
 import numpy as np
 from tqdm import tqdm
 import torch
@@ -72,46 +73,51 @@ class ASRDataset(Dataset):
                                           Should only be None for training set.
                                           Should be provided for dev and test sets.
         """
-        # TODO: Implement __init__
-        raise NotImplementedError # Remove once implemented
-    
         # Store basic configuration
         self.config    = config
         self.partition = partition
         self.isTrainPartition = isTrainPartition
         self.tokenizer = tokenizer
 
-        # TODO: Get tokenizer ids for special tokens (eos, sos, pad)
-        self.eos_token = NotImplementedError
-        self.sos_token = NotImplementedError
-        self.pad_token = NotImplementedError
+        # Get tokenizer ids for special tokens (eos, sos, pad)
+        self.eos_token = tokenizer.eos_id
+        self.sos_token = tokenizer.sos_id
+        self.pad_token = tokenizer.pad_id
 
-        # Set up data paths 
-        # TODO: Use root and partition to get the feature directory
-        self.fbank_dir   = NotImplementedError
-        
-        # TODO: Get all feature files in the feature directory in sorted order  
-        self.fbank_files = NotImplementedError
-        
-        # TODO: Take subset
-        subset_size      = NotImplementedError
-        self.fbank_files = NotImplementedError
-        
-        # TODO: Get the number of samples in the dataset  
-        self.length      = NotImplementedError
+        # Set up data paths
+        self.fbank_dir = os.path.join(config['root'], partition, 'fbank')
+
+        # Get all feature files in the feature directory in sorted order
+        self.fbank_files = sorted([
+            f for f in os.listdir(self.fbank_dir)
+            if f.endswith('.npy')
+        ])
+
+        # Take subset
+        subset_size = config.get('subset', None)
+        if subset_size is not None:
+            if isinstance(subset_size, float):
+                subset_size = int(len(self.fbank_files) * subset_size)
+            self.fbank_files = self.fbank_files[:subset_size]
+
+        # Get the number of samples in the dataset
+        self.length = len(self.fbank_files)
 
         # Case on partition.
         # Why will test-clean need to be handled differently?
         if self.partition != "test-clean":
-            # TODO: Use root and partition to get the text directory
-            self.text_dir   = NotImplementedError
+            # Use root and partition to get the text directory
+            self.text_dir = os.path.join(config['root'], partition, 'text')
 
-            # TODO: Get all text files in the text directory in sorted order  
-            self.text_files = NotImplementedError
-            
-            # TODO: Take subset
-            self.text_files = NotImplementedError
-            
+            # Get all text files in the text directory in sorted order
+            self.text_files = sorted([
+                f for f in os.listdir(self.text_dir)
+                if f.endswith('.npy')
+            ])
+
+            # Take subset
+            self.text_files = self.text_files[:self.length]
+
             # Verify data alignment
             if len(self.fbank_files) != len(self.text_files):
                 raise ValueError("Number of feature and transcript files must match")
@@ -128,85 +134,146 @@ class ASRDataset(Dataset):
         # DO NOT MODIFY
         self.feat_max_len = 0
         self.text_max_len = 0
-        
-        # Initialize Welford's algorithm accumulators if needed for global_mvn
-        # DO NOT MODIFY
-        if self.config['norm'] == 'global_mvn' and global_stats is None:
-            if not isTrainPartition:
-                raise ValueError("global_stats must be provided for non-training partitions when using global_mvn")
-            count = 0
-            mean = torch.zeros(self.config['num_feats'], dtype=torch.float64)
-            M2 = torch.zeros(self.config['num_feats'], dtype=torch.float64)
 
-        print(f"Loading data for {partition} partition...")
-        for i in tqdm(range(self.length)):
-            # TODO: Load features
-            # Features are of shape (num_feats, time)
-            feat = NotImplementedError
+        # --- Cache setup ---
+        _cache_key = f"{config['root']}|{partition}|{config['num_feats']}|{config.get('subset',1.0)}|{tokenizer.vocab_size}"
+        _cache_hash = hashlib.md5(_cache_key.encode()).hexdigest()[:10]
+        _cache_dir = os.path.join(config['root'], '.asr_cache')
+        os.makedirs(_cache_dir, exist_ok=True)
+        self._cache_path = os.path.join(_cache_dir, f"{partition.replace('/', '_')}_{_cache_hash}.pt")
 
-            # TODO: Truncate features to num_feats set by you in the config
-            feat = NotImplementedError
+        _feats_path = self._cache_path.replace('.pt', '_feats.npy')
+        _lens_path  = self._cache_path.replace('.pt', '_lens.npy')
 
-            # Append to self.feats (num_feats is set by you in the config)
-            self.feats.append(feat)
+        _cached = None
+        if os.path.exists(self._cache_path) and os.path.exists(_feats_path):
+            try:
+                _cached = torch.load(self._cache_path, weights_only=False)
+                print(f"[Cache] Loading {partition} from cache...")
+            except Exception as e:
+                print(f"[Cache] Failed ({e}), reprocessing...")
+                _cached = None
 
-            # Track max length (time dimension)
-            self.feat_max_len = max(self.feat_max_len, feat.shape[1])
-
-            # Update global statistics if needed (DO NOT MODIFY)
+        if _cached is not None:
+            # Load feats via memory-mapped numpy (fast, zero-copy)
+            _all_feats  = np.load(_feats_path, mmap_mode='r')
+            _feat_tlens = np.load(_lens_path)
+            _offsets    = np.concatenate([[0], np.cumsum(_feat_tlens[:-1])])
+            self.feats  = [_all_feats[:, _offsets[i]:_offsets[i]+_feat_tlens[i]]
+                           for i in range(len(_feat_tlens))]
+            self.transcripts_shifted = _cached.get('transcripts_shifted', [])
+            self.transcripts_golden  = _cached.get('transcripts_golden', [])
+            self.feat_max_len        = _cached['feat_max_len']
+            self.text_max_len        = _cached['text_max_len']
+            self.total_chars         = _cached['total_chars']
+            self.total_tokens        = _cached['total_tokens']
+            self.avg_chars_per_token = _cached['avg_chars_per_token']
+            if 'global_mean' in _cached:
+                self.global_mean = _cached['global_mean']
+                self.global_std  = _cached['global_std']
+            elif self.config['norm'] == 'global_mvn' and global_stats is not None:
+                self.global_mean, self.global_std = global_stats
+        else:
+            # Initialize Welford's algorithm accumulators if needed for global_mvn
+            # DO NOT MODIFY
             if self.config['norm'] == 'global_mvn' and global_stats is None:
-                feat_tensor = torch.FloatTensor(feat)  # (num_feats, time)
-                batch_count = feat_tensor.shape[1]     # number of time steps
-                count += batch_count
-                
-                # Update mean and M2 for all time steps at once
-                delta = feat_tensor - mean.unsqueeze(1)  # (num_feats, time)
-                mean += delta.mean(dim=1)                # (num_feats,)
-                delta2 = feat_tensor - mean.unsqueeze(1) # (num_feats, time)
-                M2 += (delta * delta2).sum(dim=1)        # (num_feats,)
+                if not isTrainPartition:
+                    raise ValueError("global_stats must be provided for non-training partitions when using global_mvn")
+                count = 0
+                mean = torch.zeros(self.config['num_feats'], dtype=torch.float64)
+                M2 = torch.zeros(self.config['num_feats'], dtype=torch.float64)
 
-            # NOTE: The following steps are almost the same as the steps in the LMDataset   
+            print(f"Loading data for {partition} partition...")
+            for i in tqdm(range(self.length)):
+                # Load features
+                # Features are of shape (num_feats, time)
+                feat = np.load(os.path.join(self.fbank_dir, self.fbank_files[i]), allow_pickle=True)
+
+                # Truncate features to num_feats set by you in the config
+                feat = feat[:config['num_feats'], :]
+
+                # Append to self.feats (num_feats is set by you in the config)
+                self.feats.append(feat)
+
+                # Track max length (time dimension)
+                self.feat_max_len = max(self.feat_max_len, feat.shape[1])
+
+                # Update global statistics if needed (DO NOT MODIFY)
+                if self.config['norm'] == 'global_mvn' and global_stats is None:
+                    feat_tensor = torch.FloatTensor(feat)  # (num_feats, time)
+                    batch_count = feat_tensor.shape[1]     # number of time steps
+                    count += batch_count
+                    
+                    # Update mean and M2 for all time steps at once
+                    delta = feat_tensor - mean.unsqueeze(1)  # (num_feats, time)
+                    mean += delta.mean(dim=1)                # (num_feats,)
+                    delta2 = feat_tensor - mean.unsqueeze(1) # (num_feats, time)
+                    M2 += (delta * delta2).sum(dim=1)        # (num_feats,)
+
+                # NOTE: The following steps are almost the same as the steps in the LMDataset   
+                
+                if self.partition != "test-clean":
+                    # Load the transcript
+                    transcript = ''.join(np.load(os.path.join(self.text_dir, self.text_files[i]), allow_pickle=True))
+
+                    # Track character count (before tokenization)
+                    self.total_chars += len(transcript)
+
+                    # Use tokenizer to encode the transcript
+                    tokenized = tokenizer.encode(transcript)
+
+                    # Track token count (excluding special tokens)
+                    # DO NOT MODIFY
+                    self.total_tokens += len(tokenized)
+
+                    # Track max length (add 1 for the sos/eos tokens)
+                    # DO NOT MODIFY
+                    self.text_max_len = max(self.text_max_len, len(tokenized)+1)
+
+                    # Create shifted and golden versions by adding sos and eos tokens
+                    self.transcripts_shifted.append([self.sos_token] + tokenized)
+                    self.transcripts_golden.append(tokenized + [self.eos_token])
+
+            # Calculate average characters per token
+            # DO NOT MODIFY 
+            self.avg_chars_per_token = self.total_chars / self.total_tokens if self.total_tokens > 0 else 0
             
             if self.partition != "test-clean":
-                # TODO: Load the transcript
-                # Important Note: This is a very important line of code and you should check whether your transcript is correct after loading (and very dependent in evaluation)
-                transcript = NotImplementedError
+                # Verify data alignment
+                if not (len(self.feats) == len(self.transcripts_shifted) == len(self.transcripts_golden)):
+                    raise ValueError("Features and transcripts are misaligned")
 
-                # TODO: Track character count (before tokenization)
-                self.total_chars += len(transcript)
+            # Compute final global statistics if needed
+            if self.config['norm'] == 'global_mvn':
+                if global_stats is not None:
+                    self.global_mean, self.global_std = global_stats
+                else:
+                    # Compute variance and standard deviation
+                    variance = M2/(count - 1)
+                    self.global_std = torch.sqrt(variance + 1e-8).float()
+                    self.global_mean = mean.float()
 
-                # TODO: Use tokenizer to encode the transcript (see tokenizer.encode for details)
-                tokenized = NotImplementedError
-
-                # Track token count (excluding special tokens)
-                # DO NOT MODIFY
-                self.total_tokens += len(tokenized)
-
-                # Track max length (add 1 for the sos/eos tokens)
-                # DO NOT MODIFY
-                self.text_max_len = max(self.text_max_len, len(tokenized)+1)
-                
-                # TODO: Create shifted and golden versions by adding sos and eos tokens   
-
-
-        # Calculate average characters per token
-        # DO NOT MODIFY 
-        self.avg_chars_per_token = self.total_chars / self.total_tokens if self.total_tokens > 0 else 0
-        
-        if self.partition != "test-clean":
-            # Verify data alignment
-            if not (len(self.feats) == len(self.transcripts_shifted) == len(self.transcripts_golden)):
-                raise ValueError("Features and transcripts are misaligned")
-
-        # Compute final global statistics if needed
-        if self.config['norm'] == 'global_mvn':
-            if global_stats is not None:
-                self.global_mean, self.global_std = global_stats
-            else:
-                # Compute variance and standard deviation
-                variance = M2/(count - 1)
-                self.global_std = torch.sqrt(variance + 1e-8).float()
-                self.global_mean = mean.float()
+            # Save feats as single contiguous numpy array (fast)
+            print(f"[Cache] Saving {partition}...")
+            _feat_tlens    = np.array([f.shape[1] for f in self.feats], dtype=np.int64)
+            _all_feats_cat = np.concatenate(self.feats, axis=1)
+            np.save(_feats_path, _all_feats_cat)
+            np.save(_lens_path,  _feat_tlens)
+            # Save small metadata (transcripts + stats) via torch
+            _cache_data = {
+                'transcripts_shifted': self.transcripts_shifted,
+                'transcripts_golden':  self.transcripts_golden,
+                'feat_max_len':        self.feat_max_len,
+                'text_max_len':        self.text_max_len,
+                'total_chars':         self.total_chars,
+                'total_tokens':        self.total_tokens,
+                'avg_chars_per_token': self.avg_chars_per_token,
+            }
+            if self.config['norm'] == 'global_mvn' and global_stats is None:
+                _cache_data['global_mean'] = self.global_mean
+                _cache_data['global_std']  = self.global_std
+            torch.save(_cache_data, self._cache_path)
+            print(f"[Cache] Saved {partition} to {self._cache_path}")
 
         # Initialize SpecAugment transforms
         self.time_mask = tat.TimeMasking(
@@ -230,8 +297,7 @@ class ASRDataset(Dataset):
         Return the number of samples in the dataset.
         DO NOT MODIFY
         """
-        # TODO: Implement __len__
-        raise NotImplementedError
+        return self.length
 
     def __getitem__(self, idx) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -246,11 +312,10 @@ class ASRDataset(Dataset):
                 - shifted_transcript: LongTensor (time) or None
                 - golden_transcript: LongTensor  (time) or None
         """
-        # TODO: Load features
-        feat = NotImplementedError
-        raise NotImplementedError
+        # Load features
+        feat = torch.FloatTensor(np.array(self.feats[idx]))
 
-        # TODO: Apply normalization
+        # Apply normalization
         if self.config['norm'] == 'global_mvn':
             assert self.global_mean is not None and self.global_std is not None, "Global mean and std must be computed before normalization"
             feat = (feat - self.global_mean.unsqueeze(1)) / (self.global_std.unsqueeze(1) + 1e-8)
@@ -262,11 +327,11 @@ class ASRDataset(Dataset):
         # TODO: Get transcripts for non-test partitions
         shifted_transcript, golden_transcript = None, None
         if self.partition != "test-clean":
-            # TODO: Get transcripts for non-test partitions
-            shifted_transcript = NotImplementedError
-            golden_transcript  = NotImplementedError
+            # Get transcripts for non-test partitions
+            shifted_transcript = torch.LongTensor(self.transcripts_shifted[idx])
+            golden_transcript  = torch.LongTensor(self.transcripts_golden[idx])
 
-        raise NotImplementedError # Remove once implemented
+        return feat, shifted_transcript, golden_transcript
 
     def collate_fn(self, batch) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -285,47 +350,43 @@ class ASRDataset(Dataset):
         """
         # TODO: Implement collate_fn
 
-        # TODO: Collect transposed features from the batch into a list of tensors (B x T x F)
-        batch_feats  = NotImplementedError
+        # Collect transposed features (each feat is num_feats x T -> T x num_feats)
+        batch_feats  = [feat.transpose(0, 1) for feat, _, _ in batch]
 
-        # TODO: Collect feature lengths from the batch into a tensor
-        feat_lengths = NotImplementedError # B
+        # Collect feature lengths
+        feat_lengths = torch.LongTensor([f.size(0) for f in batch_feats])
 
-        # TODO: Pad features to create a batch of fixed-length padded features
-        padded_feats = NotImplementedError # B x T x F
+        # Pad features to create a batch of fixed-length padded features
+        padded_feats = pad_sequence(batch_feats, batch_first=True, padding_value=0.0)
 
-        # TODO: Handle transcripts for non-test partitions
+        # Handle transcripts for non-test partitions
         padded_shifted, padded_golden, transcript_lengths = None, None, None
         if self.partition != "test-clean":
-            # TODO: Collect shifted and golden transcripts from the batch into a list of tensors (B x T)  
-            batch_shifted      = NotImplementedError # B x T
-            batch_golden       = NotImplementedError # B x T
+            batch_shifted = [shifted for _, shifted, _ in batch]
+            batch_golden  = [golden  for _, _, golden  in batch]
 
-            # TODO: Collect transcript lengths from the batch into a tensor
-            transcript_lengths = NotImplementedError # B  
+            transcript_lengths = torch.LongTensor([len(s) for s in batch_shifted])
 
-            # TODO: Pad transcripts to create a batch of fixed-length padded transcripts
-            padded_shifted     = NotImplementedError # B x T
-            padded_golden      = NotImplementedError # B x T
+            padded_shifted = pad_sequence(batch_shifted, batch_first=True, padding_value=self.pad_token)
+            padded_golden  = pad_sequence(batch_golden,  batch_first=True, padding_value=self.pad_token)
 
-        # TODO: Apply SpecAugment for training
+        # Apply SpecAugment for training
         if self.config["specaug"] and self.isTrainPartition:
-            # TODO: Permute the features to (B x F x T)
-            padded_feats = NotImplementedError # B x F x T
+            # Permute to (B x F x T)
+            padded_feats = padded_feats.permute(0, 2, 1)
 
-            # TODO: Apply frequency masking
+            # Apply frequency masking
             if self.config["specaug_conf"]["apply_freq_mask"]:
                 for _ in range(self.config["specaug_conf"]["num_freq_mask"]):
-                    padded_feats = NotImplementedError
+                    padded_feats = self.freq_mask(padded_feats)
 
-            # TODO: Apply time masking
+            # Apply time masking
             if self.config["specaug_conf"]["apply_time_mask"]:
                 for _ in range(self.config["specaug_conf"]["num_time_mask"]):
-                    padded_feats = NotImplementedError
+                    padded_feats = self.time_mask(padded_feats)
 
-            # TODO: Permute the features back to (B x T x F)
-            padded_feats = NotImplementedError # B x T x F
+            # Permute back to (B x T x F)
+            padded_feats = padded_feats.permute(0, 2, 1)
 
-        # TODO: Return the padded features, padded shifted, padded golden, feature lengths, and transcript lengths
-        raise NotImplementedError # Remove once implemented
+        return padded_feats, padded_shifted, padded_golden, feat_lengths, transcript_lengths
 

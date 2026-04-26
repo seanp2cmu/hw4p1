@@ -7,30 +7,24 @@ import copy
 
 def _epochs_to_steps(epochs: int, train_loader: torch.utils.data.DataLoader, gradient_accumulation_steps: int = 1) -> int:
     """Convert epochs to total steps based on the train loader length."""
-    return epochs * len(train_loader)
+    import math
+    return epochs * math.ceil(len(train_loader) / gradient_accumulation_steps)
 
 def create_scheduler(
     optimizer: torch.optim.Optimizer,
     scheduler_config: Dict[str, Any],
     train_loader: torch.utils.data.DataLoader,
-    gradient_accumulation_steps: int = 1
+    gradient_accumulation_steps: int = 1,
+    num_epochs: int = 100
 ) -> torch.optim.lr_scheduler._LRScheduler:
     """
     Create learning rate scheduler based on config settings.
     All schedulers except ReduceLROnPlateau are configured to be step-based.
     """
     scheduler_name = scheduler_config['name'].lower()
-    steps_per_epoch = len(train_loader) // gradient_accumulation_steps
 
     print("\n📈 Configuring Learning Rate Scheduler:")
     print(f"├── Type: {scheduler_name.upper()}")
-
-    # Check for invalid warmup + ReduceLROnPlateau combination
-    if scheduler_name == 'reduce_lr' and scheduler_config.get('warmup', {}).get('enabled', False):
-        raise ValueError(
-            "ReduceLROnPlateau scheduler cannot be combined with warmup. "
-            "Please either disable warmup or use a different scheduler (cosine, cosine_warm)."
-        )
 
     # Create base scheduler
     if scheduler_name == 'reduce_lr':
@@ -94,67 +88,36 @@ def create_scheduler(
             last_epoch=warm_config.get('last_epoch', -1)
         )
 
+    elif scheduler_name == 'onecycle':
+        onecycle_config = scheduler_config['onecycle']
+        total_steps = _epochs_to_steps(num_epochs, train_loader, gradient_accumulation_steps)
+        max_lr = [group['lr'] for group in optimizer.param_groups]
+
+        print("├── OneCycleLR Settings:")
+        print(f"│   ├── Total Epochs: {num_epochs} ({total_steps} steps)")
+        print(f"│   ├── Max LR (first group): {max_lr[0]}")
+        print(f"│   ├── Pct Start: {onecycle_config.get('pct_start', 0.1)}")
+        print(f"│   ├── Div Factor: {onecycle_config.get('div_factor', 10)}")
+        print(f"│   └── Final Div Factor: {onecycle_config.get('final_div_factor', 1000)}")
+
+        return lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=max_lr,
+            total_steps=total_steps,
+            pct_start=onecycle_config.get('pct_start', 0.1),
+            anneal_strategy=onecycle_config.get('anneal_strategy', 'cos'),
+            div_factor=onecycle_config.get('div_factor', 10),
+            final_div_factor=onecycle_config.get('final_div_factor', 1000),
+            three_phase=onecycle_config.get('three_phase', False),
+        )
+
     else:
         raise ValueError(
             f"Unsupported scheduler: {scheduler_name}. "
-            f"Supported: ['reduce_lr', 'cosine', 'cosine_warm']"
+            f"Supported: ['reduce_lr', 'cosine', 'cosine_warm', 'onecycle']"
         )
 
-    # Add warmup if enabled
-    if scheduler_config.get('warmup', {}).get('enabled', False):
-        warmup_config = scheduler_config['warmup']
-        warmup_epochs = warmup_config.get('epochs', 5)
-        warmup_steps = warmup_epochs * steps_per_epoch
-        print("├── Warmup Settings:")
-        print(f"│   ├── Duration: {warmup_epochs} epochs ({warmup_steps} steps)")
-        print(f"│   ├── Start Factor: {warmup_config.get('start_factor', 0.1)}")
-        print(f"│   └── End Factor: {warmup_config.get('end_factor', 1.0)}")
-
-        scheduler = create_warmup_scheduler(
-            optimizer,
-            base_scheduler,
-            warmup_config,
-            train_loader
-        )
-    else:
-        print("└── Warmup: Disabled")
-        scheduler = base_scheduler
-
-    return scheduler
-
-
-def create_warmup_scheduler(
-    optimizer: torch.optim.Optimizer,
-    base_scheduler: torch.optim.lr_scheduler._LRScheduler,
-    warmup_config: Dict[str, Any],
-    train_loader: torch.utils.data.DataLoader
-) -> torch.optim.lr_scheduler.SequentialLR:
-    """
-    Create a warmup scheduler wrapped around the base scheduler.
-    """
-    warmup_epochs = warmup_config.get('epochs', 5)
-    start_factor = warmup_config.get('start_factor', 0.1)
-    end_factor = warmup_config.get('end_factor', 1.0)
-
-    # Calculate the number of warmup steps
-    warmup_steps = len(train_loader) * warmup_epochs
-
-    # Create warmup scheduler
-    warmup_scheduler = lr_scheduler.LinearLR(
-        optimizer,
-        start_factor=start_factor,
-        end_factor=end_factor,
-        total_iters=warmup_steps
-    )
-
-    # Combine warmup with main scheduler
-    scheduler = lr_scheduler.SequentialLR(
-        optimizer,
-        schedulers=[warmup_scheduler, base_scheduler],
-        milestones=[warmup_steps]
-    )
-
-    return scheduler
+    return base_scheduler
 
 
 def plot_lr_schedule(

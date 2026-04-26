@@ -1,9 +1,10 @@
 
-Name                      : "Enter-Name-Here"
+
+Name                      : "Sean Park"
 
 ###### Tokenization ------------------------------------------------------------
 tokenization:
-  token_type                : "char"       # [char, 1k, 5k, 10k]
+  token_type                : "5k"       # [char, 1k, 5k, 10k]
   token_map :
       'char': 'hw4lib/data/tokenizer_jsons/tokenizer_char.json'
       '1k'  : 'hw4lib/data/tokenizer_jsons/tokenizer_1000.json'
@@ -11,58 +12,87 @@ tokenization:
       '10k' : 'hw4lib/data/tokenizer_jsons/tokenizer_10000.json'
 
 ###### Dataset -----------------------------------------------------------------
-data:                    # Currently setup for Colab assuming out setup
-  root                 : "./hw4_data/hw4p1_data"  # TODO: Set the root path of your data
-  train_partition      : "train"  # train
-  val_partition        : "val"    # val
-  test_partition       : "test"   # test
-  subset               : 1.0      # Load a subset of the data (for debugging, testing, etc
-  batch_size           : 256      #
-  NUM_WORKERS          : 4        # Set to 0 for CPU
+data:
+  root                 : "/tmp/hw4_data/hw4p2_data" 
+  train_partition      : "train-clean-100"  # paired text-speech for ASR pre-training
+  val_partition        : "dev-clean"        # paired text-speech for ASR pre-training
+  test_partition       : "test-clean"       # paired text-speech for ASR pre-training
+  subset               : 1.0                # Load a subset of the data (for debugging, testing, etc
+  batch_size           : 32            #
+  NUM_WORKERS          : 20            # Set to 0 for CPU
+  norm                 : 'global_mvn' # ['global_mvn', 'cepstral', 'none']
+  num_feats            : 80
+
+  ###### SpecAugment ---------------------------------------------------------------
+  specaug                   : True  # Set to True if you want to use SpecAugment
+  specaug_conf:
+    apply_freq_mask         : True
+    freq_mask_width_range   : 8
+    num_freq_mask           : 1
+    apply_time_mask         : True
+    time_mask_width_range   : 40
+    num_time_mask           : 4
 
 ###### Network Specs -------------------------------------------------------------
-model: # Decoder-Only Language Model (HW4P1)
-  d_model                   : 256
-  d_ff                      : 1024
-  num_layers                : 2
-  num_heads                 : 2
-  dropout                   : 0.0
-  layer_drop_rate           : 0.0
-  weight_tying              : False
+model: # Encoder-Decoder Transformer (HW4P2)
+  # Speech embedding parameters
+  input_dim: 80              # Speech feature dimension
+  time_reduction: 4          # Time dimension downsampling factor
+  reduction_method: 'conv'   # The source_embedding reduction method ['lstm', 'conv', 'both']
+
+  # Architecture parameters
+  d_model: 256           # Model dimension
+  num_encoder_layers: 8  # Number of encoder layers
+  num_decoder_layers: 6  # Number of decoder layers
+  num_encoder_heads: 4   # Number of encoder attention heads
+  num_decoder_heads: 4   # Number of decoder attention heads
+  d_ff_encoder: 2048     # Feed-forward dimension for encoder
+  d_ff_decoder: 2048     # Feed-forward dimension for decoder
+  skip_encoder_pe: False # Whether to skip positional encoding for encoder
+  skip_decoder_pe: False # Whether to skip positional encoding for decoder
+
+  # Common parameters
+  dropout: 0.1          # Dropout rate
+  layer_drop_rate: 0.1  # Layer dropout rate
+  weight_tying: True    # Whether to use weight tying
 
 ###### Common Training Parameters ------------------------------------------------
 training:
   use_wandb                   : True   # Toggle wandb logging
   wandb_run_id                : "none" # "none" or "run_id"
-  resume                      : False  # Resume an existing run (run_id != 'none')
-  epochs                      : 20
-  gradient_accumulation_steps : 1
-  wandb_project               : "hw4p1" # wandb project to log to
+  wandb_run_name              : "run7-8enc-6dec-28M-cosine-500ep"
+  resume                      : False   # Resume an existing run (run_id != 'none')
+  epochs                      : 500
+  gradient_accumulation_steps : 4
+  swa_start_epoch             : 450  # Start SWA at epoch 450 (90% of 500)
+  wandb_project               : "hw4p2" # wandb project to log to
 
 ###### Loss ----------------------------------------------------------------------
 loss: # Just good ol' CrossEntropy
-  label_smoothing: 0.0
+  label_smoothing: 0.1
+  ctc_weight: 0.3
 
 ###### Optimizer -----------------------------------------------------------------
 optimizer:
-  name: "adam" # Options: sgd, adam, adamw
-  lr: 5.0e-4   # Base learning rate
+  name: "adamw" # Options: sgd, adam, adamw
+  lr: 0.0004    # Base learning rate
 
   # Common parameters
-  weight_decay: 0.0001
+  weight_decay: 0.01
 
   # Parameter groups
+  # You can add more param groups as you want and set their learning rates and patterns
   param_groups:
     - name: self_attn
-      patterns: []  # Will match all parameters containing keywords set their learning rate to 0.0001
-      lr: 0.0001    # LR for self_attn
+      patterns: []  # Will match all parameters containing "ffn" and set their learning rate to 0.0002
+      lr: 0.0002    # LR for self_attn
       layer_decay:
         enabled: False
         decay_rate: 0.8
 
     - name: ffn
-      patterns: [] # Will match all parameters containing "ffn" and set their learning rate to 0.0001
-      lr: 0.0001   # LR for ffn
+      patterns: [] # Will match all parameters containing "ffn" and set their learning rate to 0.0002
+      lr: 0.0002   # LR for ffn
       layer_decay:
         enabled: False
         decay_rate: 0.8
@@ -92,7 +122,7 @@ optimizer:
 
 ###### Scheduler -----------------------------------------------------------------
 scheduler:
-  name: "cosine"  # Options: reduce_lr, cosine, cosine_warm
+  name: "cosine_warm"  # Options: reduce_lr, cosine, cosine_warm, onecycle
 
   # ReduceLROnPlateau specific parameters
   reduce_lr:
@@ -103,25 +133,25 @@ scheduler:
     threshold_mode: "rel"  # Options: rel, abs
     cooldown: 0  # Number of epochs to wait before resuming normal operation
     min_lr: 0.0000001  # Minimum learning rate
-    eps: 1.0e-8  # Minimal decay applied to lr
+    eps: 1e-8  # Minimal decay applied to lr
 
   # CosineAnnealingLR specific parameters
   cosine:
-    T_max: 15  # Maximum number of iterations
-    eta_min: 1.0e-8  # Minimum learning rate
+    T_max: 30  # Maximum number of iterations
+    eta_min: 0.0000001  # Minimum learning rate
     last_epoch: -1
 
   # CosineAnnealingWarmRestarts specific parameters
   cosine_warm:
-    T_0: 4  # Number of iterations for the first restart
-    T_mult: 4  # Factor increasing T_i after each restart
-    eta_min: 0.0000001  # Minimum learning rate
+    T_0: 100   # First cycle: 100 epochs (0-100, 100-300, 300-500)
+    T_mult: 2  # Each cycle doubles in length
+    eta_min: 0.00001  # Minimum learning rate (1e-5)
     last_epoch: -1
 
-  # Warmup parameters (can be used with any scheduler)
-  warmup:
-    enabled: True
-    type: "exponential"  # Options: linear, exponential
-    epochs: 5
-    start_factor: 0.1
-    end_factor: 1.0
+  # OneCycleLR specific parameters
+  onecycle:
+    pct_start: 0.05        # 5% warmup (e.g. 5 epochs out of 100)
+    div_factor: 10         # initial_lr = max_lr / div_factor
+    final_div_factor: 1000 # final_lr = initial_lr / final_div_factor
+    anneal_strategy: 'cos'
+    three_phase: False

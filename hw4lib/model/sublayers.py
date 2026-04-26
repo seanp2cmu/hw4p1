@@ -59,7 +59,8 @@ class SelfAttentionLayer(nn.Module):
         '''
         residual = x
         x = self.norm(x)
-        x, mha_attn_weights = self.mha(x, x, x, key_padding_mask=key_padding_mask, attn_mask=attn_mask, need_weights=True, average_attn_weights=True)
+        need_weights = not self.training
+        x, mha_attn_weights = self.mha(x, x, x, key_padding_mask=key_padding_mask, attn_mask=attn_mask, need_weights=need_weights, average_attn_weights=True)
         x = residual + self.dropout(x)
         return x, mha_attn_weights
     
@@ -108,7 +109,8 @@ class CrossAttentionLayer(nn.Module):
         '''
         residual = x
         x = self.norm(x)
-        x, mha_attn_weights = self.mha(x, y, y, key_padding_mask=key_padding_mask, attn_mask=attn_mask, need_weights=True, average_attn_weights=True)
+        need_weights = not self.training
+        x, mha_attn_weights = self.mha(x, y, y, key_padding_mask=key_padding_mask, attn_mask=attn_mask, need_weights=need_weights, average_attn_weights=True)
         x = residual + self.dropout(x)
         return x, mha_attn_weights
     

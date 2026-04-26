@@ -88,7 +88,7 @@ class LMDataset(Dataset):
         print(f"Loading transcripts for {partition} partition...")
         for file in tqdm(self.text_files):
             # TODO: Load the transcript
-            transcript = str(np.load(file, allow_pickle=True))
+            transcript = ''.join(np.load(file, allow_pickle=True))
             
             # Track character count (before tokenization)
             # DO NOT MODIFY

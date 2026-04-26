@@ -197,10 +197,11 @@ class BaseTrainer(ABC):
                     config=self.config
                 )
             else:
+                wandb_name = self.config['training'].get('wandb_run_name', run_name)
                 self.wandb_run = wandb.init(
                     project=self.config['training'].get('wandb_project', 'default-project'),
                     config=self.config,
-                    name=run_name
+                    name=wandb_name
                 )
 
         return expt_root, checkpoint_dir, attn_dir, text_dir, best_model_path, last_model_path
